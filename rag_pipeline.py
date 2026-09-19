@@ -109,26 +109,53 @@ def extract_video_id(url: str):
     return match.group(1) if match else None
 
 
+PREFERRED_LANGUAGES = ["en", "en-US", "en-GB"]
+
+
+def _extract_text(fetched) -> str:
+    """
+    Turn a fetched transcript into plain text. Handles both the new API's
+    objects (snippet.text) and the old API's plain dicts (item["text"]).
+    """
+    try:
+        return " ".join(snippet.text for snippet in fetched)
+    except AttributeError:
+        return " ".join(item["text"] for item in fetched)
+
+
 def _fetch_transcript_text(video_id: str) -> str:
     """
-    Fetch a YouTube video's transcript as one plain-text string.
+    Fetch a YouTube video's transcript as plain text.
 
-    youtube-transcript-api changed its interface in v1.0: the old static
-    methods (`YouTubeTranscriptApi.get_transcript(...)`) were replaced by
-    an instance-based `.fetch(...)`. We try the new interface first and
-    fall back to the old one, so this keeps working no matter which
-    version ends up installed — that mismatch is what causes "no
-    transcript found" errors when LangChain's built-in loader is used
-    instead (it only knows the old interface).
+    Tries English captions first; many videos only have auto-generated
+    captions in a different language, so if English isn't available this
+    falls back to whichever transcript the video actually has, rather
+    than failing outright.
+
+    Also handles the youtube-transcript-api v1.0 interface change: the
+    old static methods (`YouTubeTranscriptApi.get_transcript(...)`) were
+    replaced by an instance-based `.fetch(...)`. We try the new interface
+    first and fall back to the old one, so this keeps working no matter
+    which version is installed.
     """
     try:
         # youtube-transcript-api >= 1.0
-        fetched = YouTubeTranscriptApi().fetch(video_id)
-        return " ".join(snippet.text for snippet in fetched)
+        api = YouTubeTranscriptApi()
+        try:
+            fetched = api.fetch(video_id, languages=PREFERRED_LANGUAGES)
+        except Exception:
+            # No English transcript — grab whatever language IS available.
+            transcript_list = api.list(video_id)
+            fetched = next(iter(transcript_list)).fetch()
     except AttributeError:
         # youtube-transcript-api < 1.0
-        raw = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join(item["text"] for item in raw)
+        try:
+            fetched = YouTubeTranscriptApi.get_transcript(video_id, languages=PREFERRED_LANGUAGES)
+        except Exception:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            fetched = next(iter(transcript_list)).fetch()
+
+    return _extract_text(fetched)
 
 
 def load_and_split_youtube(url: str):
