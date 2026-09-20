@@ -343,11 +343,20 @@ def get_answer(
     """
     Retrieve top-k chunks and ask the Groq LLM to answer only from context.
     """
-    retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": k},
-    )
+   retriever = vector_store.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={
+        "k": k,
+        "score_threshold": 0.1,
+    },
+)
 
+relevant_docs = retriever.invoke(question)
+ if not relevant_docs:
+    return {
+        "answer": "I could not find this information in the provided documents.",
+        "sources": [],
+    }
     relevant_docs = retriever.invoke(question)
 
     context_text = "\n\n".join(
