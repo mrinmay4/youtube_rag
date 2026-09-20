@@ -1,12 +1,20 @@
 """
 app.py
 ------
-Streamlit UI only. All retrieval/LLM logic lives in rag_pipeline.py —
-this file wires user actions (add PDF, add YouTube video, ask) to those
-functions and displays the results.
 
-Both source types feed into ONE shared FAISS vector store, so a question
-can be answered using PDF content, YouTube transcript content, or both.
+Streamlit UI for a persistent Document + YouTube RAG assistant.
+
+Important change from the previous version:
+- st.session_state is still used for the current browser session.
+- The FAISS index and indexed-source list are also persisted to disk.
+- A fresh browser session restores the previous knowledge base.
+- Chat history remains session-specific so users do not see another
+  user's conversation.
+
+For Streamlit Community Cloud, the local filesystem is ephemeral. For
+true persistence across container restarts/redeployments, set
+RAG_PERSIST_DIR to a persistent mounted volume or replace the persistence
+functions with object storage/database storage such as S3/Supabase.
 """
 
 import os
@@ -22,39 +30,28 @@ from rag_pipeline import (
     add_chunks_to_store,
     get_answer,
     format_sources,
+    load_persistent_state,
+    persist_vector_store,
+    clear_persistent_state,
 )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Environment / API key
-# ============================================================================
+# ----------------------------------------------------------------------------
 
-# Load .env from the same directory as this script.
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 
 def get_groq_api_key():
-    """
-    Get GROQ_API_KEY from Streamlit Cloud Secrets first,
-    then fall back to the local .env environment variable.
-
-    Streamlit Cloud:
-        st.secrets["GROQ_API_KEY"]
-
-    Local:
-        .env -> GROQ_API_KEY=...
-    """
-
-    # Try Streamlit Secrets first
+    """Read GROQ_API_KEY from Streamlit Secrets or local .env."""
     try:
         api_key = st.secrets.get("GROQ_API_KEY")
         if api_key:
             return api_key, "Streamlit Secrets"
     except Exception:
-        # No Streamlit secrets configured
         pass
 
-    # Fallback to environment variable / .env
     api_key = os.getenv("GROQ_API_KEY")
 
     if api_key:
@@ -63,13 +60,12 @@ def get_groq_api_key():
     return None, None
 
 
-# Get API key
 api_key, api_key_source = get_groq_api_key()
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Page configuration
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Document & YouTube RAG Assistant",
@@ -78,71 +74,95 @@ st.set_page_config(
 )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Header
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 st.title("📚 Document & YouTube RAG Assistant")
 
 st.caption(
     "Add PDF documents and/or YouTube videos, then ask questions. "
-    "Answers are generated only from what you've added — nothing else."
+    "The knowledge base is persisted so it can be restored in a new session."
 )
 
 
-# ============================================================================
-# Session state
-# ============================================================================
+# ----------------------------------------------------------------------------
+# Session + persisted state
+# ----------------------------------------------------------------------------
 
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
+if "_persistence_loaded" not in st.session_state:
+    try:
+        (
+            st.session_state.vector_store,
+            st.session_state.indexed_sources,
+        ) = load_persistent_state()
 
-if "indexed_sources" not in st.session_state:
-    st.session_state.indexed_sources = []
+    except Exception as e:
+        st.session_state.vector_store = None
+        st.session_state.indexed_sources = []
+        st.warning(
+            f"Saved knowledge base could not be loaded: {e}"
+        )
 
-if "history" not in st.session_state:
+    st.session_state.history = []
+    st.session_state._persistence_loaded = True
+
+elif "history" not in st.session_state:
     st.session_state.history = []
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Sidebar
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    # API key status
     if api_key:
-        st.success(f"Groq API key loaded from {api_key_source}")
+        st.success(
+            f"Groq API key loaded from {api_key_source}"
+        )
     else:
         st.error(
             "GROQ_API_KEY not found. "
             "Add it to Streamlit Secrets or your local .env file."
         )
 
-    # Retrieval parameter
     top_k = st.slider(
         "Chunks to retrieve (k)",
         min_value=2,
         max_value=8,
         value=4,
-        help="How many chunks to retrieve from the knowledge base for each question.",
+        help=(
+            "How many chunks to retrieve from the knowledge base "
+            "for each question."
+        ),
     )
 
     st.divider()
 
-    # Clear conversation
+    if st.session_state.vector_store is not None:
+        st.success("Knowledge base: persisted")
+
+    st.caption(
+        "Saved index: data/faiss_store/"
+    )
+
+    st.divider()
+
     if st.session_state.history:
         if st.button("🗑️ Clear conversation"):
             st.session_state.history = []
             st.rerun()
 
-    # Clear all sources
     if st.session_state.indexed_sources:
         if st.button("🗑️ Clear all sources"):
+            clear_persistent_state()
+
             st.session_state.vector_store = None
             st.session_state.indexed_sources = []
             st.session_state.history = []
+
             st.rerun()
 
     st.divider()
@@ -152,10 +172,14 @@ with st.sidebar:
         "shared FAISS → retrieve → Groq LLM → answer"
     )
 
+    st.caption(
+        "Persistence: FAISS index + source metadata are saved on disk."
+    )
 
-# ============================================================================
+
+# ----------------------------------------------------------------------------
 # Step 1: Add sources
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 st.subheader("1. Add sources")
 
@@ -164,9 +188,9 @@ pdf_tab, youtube_tab = st.tabs(
 )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # PDF tab
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 with pdf_tab:
 
@@ -197,22 +221,31 @@ with pdf_tab:
                         st.session_state.vector_store,
                     )
 
-                    st.session_state.indexed_sources.extend(
-                        f.name for f in uploaded_files
+                    for uploaded_file in uploaded_files:
+                        if uploaded_file.name not in st.session_state.indexed_sources:
+                            st.session_state.indexed_sources.append(
+                                uploaded_file.name
+                            )
+
+                    persist_vector_store(
+                        st.session_state.vector_store,
+                        st.session_state.indexed_sources,
                     )
 
                     st.success(
                         f"Indexed {len(chunks)} chunks from "
-                        f"{len(uploaded_files)} PDF(s)."
+                        f"{len(uploaded_files)} PDF(s) and saved them."
                     )
 
             except Exception as e:
-                st.error(f"Error while processing PDF(s): {e}")
+                st.error(
+                    f"Error while processing PDF(s): {e}"
+                )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # YouTube tab
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 with youtube_tab:
 
@@ -221,9 +254,12 @@ with youtube_tab:
         placeholder="https://www.youtube.com/watch?v=...",
     )
 
-    video_id = extract_video_id(video_url) if video_url else None
+    video_id = (
+        extract_video_id(video_url)
+        if video_url
+        else None
+    )
 
-    # Display YouTube thumbnail
     if video_id:
         st.image(
             f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
@@ -234,7 +270,6 @@ with youtube_tab:
             "⚠️ That doesn't look like a valid YouTube URL yet."
         )
 
-    # Add YouTube transcript
     if st.button(
         "Add video to knowledge base",
         disabled=not video_id,
@@ -243,24 +278,37 @@ with youtube_tab:
             "Fetching transcript, splitting into chunks, and indexing..."
         ):
             try:
-                chunks = load_and_split_youtube(video_url)
-
-                if not chunks:
-                    st.error(
-                        "No transcript could be found for this video."
+                # Avoid indexing the exact same URL repeatedly.
+                if video_url in st.session_state.indexed_sources:
+                    st.info(
+                        "This video is already in the knowledge base."
                     )
                 else:
-                    st.session_state.vector_store = add_chunks_to_store(
-                        chunks,
-                        st.session_state.vector_store,
-                    )
+                    chunks = load_and_split_youtube(video_url)
 
-                    st.session_state.indexed_sources.append(video_url)
+                    if not chunks:
+                        st.error(
+                            "No transcript could be found for this video."
+                        )
+                    else:
+                        st.session_state.vector_store = add_chunks_to_store(
+                            chunks,
+                            st.session_state.vector_store,
+                        )
 
-                    st.success(
-                        f"Indexed {len(chunks)} chunks "
-                        "from the video transcript."
-                    )
+                        st.session_state.indexed_sources.append(
+                            video_url
+                        )
+
+                        persist_vector_store(
+                            st.session_state.vector_store,
+                            st.session_state.indexed_sources,
+                        )
+
+                        st.success(
+                            f"Indexed {len(chunks)} chunks from the "
+                            "video transcript and saved them."
+                        )
 
             except Exception as e:
                 st.error(
@@ -268,9 +316,9 @@ with youtube_tab:
                 )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Show indexed sources
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 if st.session_state.indexed_sources:
 
@@ -281,27 +329,25 @@ if st.session_state.indexed_sources:
         for source in st.session_state.indexed_sources:
             st.markdown(f"- {source}")
 
+else:
+    st.info(
+        "No sources are indexed yet. Add a PDF or YouTube video above."
+    )
+
 
 st.divider()
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Step 2: Ask questions
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 st.subheader("2. Ask a question")
 
 
-if st.session_state.vector_store is None:
-
-    st.info(
-        "Add at least one PDF or YouTube video above before asking a question."
-    )
-
-
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Display previous conversation
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 for question_text, answer_text, sources in st.session_state.history:
 
@@ -317,9 +363,9 @@ for question_text, answer_text, sources in st.session_state.history:
                     st.markdown(f"- {source}")
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Chat input
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 question = st.chat_input(
     "Ask something about your added documents/videos...",
@@ -327,27 +373,23 @@ question = st.chat_input(
 )
 
 
-# ============================================================================
+# ----------------------------------------------------------------------------
 # Process question
-# ============================================================================
+# ----------------------------------------------------------------------------
 
 if question:
 
     if not api_key:
-
         st.error(
             "GROQ_API_KEY is not configured. "
             "Add it to Streamlit Secrets or your local .env file."
         )
 
     else:
-
         with st.spinner(
             "Retrieving relevant chunks and generating an answer..."
         ):
-
             try:
-
                 result = get_answer(
                     vector_store=st.session_state.vector_store,
                     question=question,
@@ -370,7 +412,6 @@ if question:
                 st.rerun()
 
             except Exception as e:
-
                 st.error(
                     f"Something went wrong while generating "
                     f"the answer: {e}"
